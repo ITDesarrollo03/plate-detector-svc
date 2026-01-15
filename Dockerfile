@@ -11,10 +11,15 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 
 COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+RUN pip install --upgrade pip && \
+    pip install --no-cache-dir --default-timeout=300 --retries=15 -r requirements.txt
+
 
 COPY app ./app
 COPY models ./models
+
+RUN apt-get update && apt-get install -y tesseract-ocr \
+    && rm -rf /var/lib/apt/lists/*
 
 EXPOSE 8000
 
