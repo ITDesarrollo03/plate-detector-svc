@@ -21,6 +21,11 @@ def get_detector() -> PlateDetectorPort:
 def get_ocr() -> OcrPort:
     return TesseractAdapter()
 
+@lru_cache()
+def get_doc_ocr() -> OcrPort:
+    # Generic OCR config for paragraph text
+    return TesseractAdapter(config="--oem 3 --psm 6")
+
 @router.post("/detect")
 async def detect(
     file: UploadFile = File(...),
@@ -115,4 +120,36 @@ async def ocr(
         "rawText": raw_text,
         "detConf": result.confidence,
         "bbox": {"x": x1, "y": y1, "w": w, "h": h}
+    }
+
+
+@router.post("/extract-info", response_model=dict)
+async def extract_info(
+    file: UploadFile = File(...),
+    ocr_service: OcrPort = Depends(get_doc_ocr),
+):
+    if file.content_type not in ("image/jpeg", "image/png", "image/webp"):
+        raise HTTPException(status_code=415, detail="Only JPG/PNG/WEBP supported")
+
+    data = await file.read()
+    if not data:
+        raise HTTPException(status_code=400, detail="Empty file")
+
+    img_array = np.frombuffer(data, np.uint8)
+    img = cv2.imdecode(img_array, cv2.IMREAD_COLOR)
+    if img is None:
+        raise HTTPException(status_code=400, detail="Could not decode image")
+
+    # OCR on RGB image
+    rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+    raw_text = ocr_service.extract_text(rgb).strip()
+    if not raw_text:
+        raise HTTPException(status_code=422, detail="OCR returned empty text")
+
+    payload = services.parse_dispatch_info(raw_text)
+
+    return {
+        "fileName": file.filename,
+        "rawText": raw_text,
+        "payload": payload,
     }
