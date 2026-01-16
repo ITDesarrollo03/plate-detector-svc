@@ -1,6 +1,7 @@
 import numpy as np
 import cv2
 
+
 def crop_lr_by_projection(bin_img: np.ndarray, margin: int = 6, min_col_frac: float = 0.01):
     if bin_img is None or bin_img.size == 0:
         return bin_img
@@ -71,20 +72,23 @@ def shave_lr_edges(bin_img: np.ndarray, edge_white_frac: float = 0.55, max_shave
 
 def preprocess_for_ocr(plate_bgr: np.ndarray) -> np.ndarray:
     """
-    Devuelve binaria lista para OCR (texto blanco, fondo negro).
+    Returns a binary image ready for OCR (white text on black background).
     """
-    # 1) Crop zona útil
+    if plate_bgr is None or plate_bgr.size == 0:
+        raise ValueError("Empty plate image for OCR preprocessing")
+
+    # 1) Crop useful band of the plate (avoid top/bottom borders)
     h, w = plate_bgr.shape[:2]
     plate = plate_bgr[int(h * 0.28):int(h * 0.80), :]
 
-    # 2) Escala
+    # 2) Upscale to help OCR
     plate = cv2.resize(plate, None, fx=4, fy=4, interpolation=cv2.INTER_CUBIC)
 
     # 3) Gray + blur
     gray = cv2.cvtColor(plate, cv2.COLOR_BGR2GRAY)
     gray = cv2.GaussianBlur(gray, (5, 5), 0)
 
-    # 4) Threshold invertido (texto blanco)
+    # 4) Threshold inverted (text as white)
     thr = cv2.adaptiveThreshold(
         gray, 255,
         cv2.ADAPTIVE_THRESH_MEAN_C,
@@ -92,7 +96,7 @@ def preprocess_for_ocr(plate_bgr: np.ndarray) -> np.ndarray:
         31, 10
     )
 
-    # 5) Morph close/open
+    # 5) Morph close/open to clean noise
     thr = cv2.morphologyEx(
         thr,
         cv2.MORPH_CLOSE,
@@ -106,12 +110,16 @@ def preprocess_for_ocr(plate_bgr: np.ndarray) -> np.ndarray:
         iterations=1
     )
 
-    # 6) Quitar marcos LR + recortes
+    # 6) Trim lateral borders and keep only text region
     thr = shave_lr_edges(thr, edge_white_frac=0.55, max_shave=200)
     thr = crop_lr_by_projection(thr, margin=8, min_col_frac=0.01)
     thr = crop_bbox_text(thr, pad=6, min_area=120)
 
+    if thr is None or thr.size == 0:
+        raise ValueError("OCR preprocessing returned an empty image")
+
     return thr
+
 
 def crop_with_padding(img_bgr: np.ndarray, x1, y1, x2, y2, pad: int = 10):
     x1p = max(0, x1 - pad)

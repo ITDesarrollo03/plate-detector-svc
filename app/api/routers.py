@@ -1,9 +1,9 @@
+from functools import lru_cache
+import io
+import cv2
+import numpy as np
 from fastapi import APIRouter, UploadFile, File, HTTPException, Depends
 from fastapi.responses import StreamingResponse
-import numpy as np
-import cv2
-import io
-from app.domain.models import DetectionResult, OcrResult
 from app.ports.detector_port import PlateDetectorPort
 from app.ports.ocr_port import OcrPort
 from app.adapters.detector.yolo_adapter import YoloAdapter
@@ -11,8 +11,6 @@ from app.adapters.ocr.tesseract_adapter import TesseractAdapter
 from app.domain import image_utils, services
 
 router = APIRouter()
-
-from functools import lru_cache
 
 # Dependency Injection (Cached)
 @lru_cache()
@@ -28,13 +26,19 @@ async def detect(
     file: UploadFile = File(...),
     detector: PlateDetectorPort = Depends(get_detector)
 ):
+    if file.content_type not in ("image/jpeg", "image/png", "image/webp"):
+        raise HTTPException(status_code=415, detail="Only JPG/PNG/WEBP supported")
+
     data = await file.read()
+    if not data:
+        raise HTTPException(status_code=400, detail="Empty file")
+
     img_array = np.frombuffer(data, np.uint8)
     img = cv2.imdecode(img_array, cv2.IMREAD_COLOR)
     if img is None:
         raise HTTPException(status_code=400, detail="Could not decode image")
 
-    result: DetectionResult = detector.detect_plate(img)
+    result = detector.detect_plate(img)
     if not result:
         raise HTTPException(status_code=404, detail="No plate detected")
 
@@ -42,6 +46,9 @@ async def detect(
     x1, y1, w, h = result.box.x, result.box.y, result.box.w, result.box.h
     x2, y2 = x1 + w, y1 + h
     plate = img[y1:y2, x1:x2]
+
+    if plate.size == 0:
+        raise HTTPException(status_code=500, detail="Detector returned invalid crop")
 
     success, buffer = cv2.imencode(".jpg", plate)
     if not success:
@@ -72,7 +79,7 @@ async def ocr(
         raise HTTPException(status_code=400, detail="Could not decode image")
 
     # 1) Detect
-    result: DetectionResult = detector.detect_plate(img)
+    result = detector.detect_plate(img)
     if not result:
         # Replicating original behavior: maybe 404? 
         # The original code threw 404 inside detect_plate helper.
@@ -83,12 +90,17 @@ async def ocr(
 
     # 2) Crop with padding
     plate = image_utils.crop_with_padding(img, x1, y1, x2, y2, pad=10)
+    if plate is None or plate.size == 0:
+        raise HTTPException(status_code=500, detail="Detector returned invalid crop for OCR")
 
     # 3) Preprocess
-    thr = image_utils.preprocess_for_ocr(plate)
+    try:
+        thr = image_utils.preprocess_for_ocr(plate)
+    except ValueError as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
 
     # 4) OCR
-    raw_text = ocr_service.extract_text(thr)
+    raw_text = ocr_service.extract_text(thr).strip()
 
     # 5) Normalize
     plate_text = services.normalize_hn_plate(raw_text)
