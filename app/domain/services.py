@@ -31,6 +31,17 @@ DIGIT_FIX = str.maketrans({
 def clean_alnum_upper(s: str) -> str:
     return "".join(ch for ch in (s or "").upper() if ch.isalnum())
 
+LETTER_FIRST_FIX = {
+    "I": "T",
+    "L": "T",
+    "1": "T",
+}
+
+def _fix_first_letter(s: str) -> str:
+    if s and s[0] in LETTER_FIRST_FIX:
+        return LETTER_FIRST_FIX[s[0]] + s[1:]
+    return s
+
 
 def normalize_hn_plate(raw_text: str) -> str:
     """
@@ -41,8 +52,13 @@ def normalize_hn_plate(raw_text: str) -> str:
     if not cleaned:
         return ""
 
+    # Try fixing first letter confusion (I/L -> T) for trucks
+    cleaned_first_fixed = _fix_first_letter(cleaned)
+
     # Direct match
     m = HN_PLATE_RE.search(cleaned)
+    if not m:
+        m = HN_PLATE_RE.search(cleaned_first_fixed)
     if m:
         letters = m.group(1)
         digits = m.group(2)
@@ -50,10 +66,14 @@ def normalize_hn_plate(raw_text: str) -> str:
 
     # Try to salvage a 7-char window
     if len(cleaned) < 7:
-        return ""
+        cleaned = cleaned_first_fixed
+        if len(cleaned) < 7:
+            return ""
 
     for i in range(0, len(cleaned) - 6):
         chunk = cleaned[i:i + 7]  # 3 letters + 4 digits
+        # Apply first-letter correction on the window
+        chunk = _fix_first_letter(chunk)
         lpart = chunk[:3].translate(LETTER_FIX)
         dpart = chunk[3:].translate(DIGIT_FIX)
 

@@ -79,29 +79,43 @@ def preprocess_for_ocr(plate_bgr: np.ndarray) -> np.ndarray:
 
     # 1) Crop useful band of the plate (avoid top/bottom borders)
     h, w = plate_bgr.shape[:2]
-    plate = plate_bgr[int(h * 0.28):int(h * 0.80), :]
+    plate = plate_bgr[int(h * 0.22):int(h * 0.85), :]
 
     # 2) Upscale to help OCR
-    plate = cv2.resize(plate, None, fx=4, fy=4, interpolation=cv2.INTER_CUBIC)
+    plate = cv2.resize(plate, None, fx=5, fy=5, interpolation=cv2.INTER_CUBIC)
 
     # 3) Gray + blur
     gray = cv2.cvtColor(plate, cv2.COLOR_BGR2GRAY)
-    gray = cv2.GaussianBlur(gray, (5, 5), 0)
+    gray = cv2.GaussianBlur(gray, (3, 3), 0)
+
+    # Unsharp mask to recover edges
+    sharp = cv2.addWeighted(gray, 1.5, cv2.GaussianBlur(gray, (0, 0), 1.0), -0.5, 0)
+
+    # Boost contrast slightly
+    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+    sharp = clahe.apply(sharp)
 
     # 4) Threshold inverted (text as white)
-    thr = cv2.adaptiveThreshold(
-        gray, 255,
-        cv2.ADAPTIVE_THRESH_MEAN_C,
+    thr_adapt = cv2.adaptiveThreshold(
+        sharp, 255,
+        cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
         cv2.THRESH_BINARY_INV,
-        31, 10
+        35, 7
     )
+    # Otsu fallback
+    _, thr_otsu = cv2.threshold(sharp, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+    # Pick the one with better balance (closer to 0.5 foreground ratio)
+    def balance_score(img):
+        p = img.mean() / 255.0
+        return abs(0.5 - p)
+    thr = thr_adapt if balance_score(thr_adapt) < balance_score(thr_otsu) else thr_otsu
 
-    # 5) Morph close/open to clean noise
+    # 5) Morph close/open to clean noise without over-thickening
     thr = cv2.morphologyEx(
         thr,
         cv2.MORPH_CLOSE,
         cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5)),
-        iterations=2
+        iterations=1
     )
     thr = cv2.morphologyEx(
         thr,
@@ -127,3 +141,28 @@ def crop_with_padding(img_bgr: np.ndarray, x1, y1, x2, y2, pad: int = 10):
     x2p = min(img_bgr.shape[1], x2 + pad)
     y2p = min(img_bgr.shape[0], y2 + pad)
     return img_bgr[y1p:y2p, x1p:x2p]
+
+
+def preprocess_document_for_ocr(img_bgr: np.ndarray) -> np.ndarray:
+    """
+    Preprocesa documentos (DNI/licencia) para OCR de texto general.
+    """
+    if img_bgr is None or img_bgr.size == 0:
+        raise ValueError("Empty document image for OCR preprocessing")
+
+    # Escala para ganar resolución
+    img = cv2.resize(img_bgr, None, fx=2.0, fy=2.0, interpolation=cv2.INTER_CUBIC)
+
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    gray = cv2.bilateralFilter(gray, d=7, sigmaColor=40, sigmaSpace=40)
+
+    # Threshold suave para mantener espacios
+    thr = cv2.adaptiveThreshold(
+        gray, 255,
+        cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+        cv2.THRESH_BINARY,
+        35, 15
+    )
+
+    # Inverción si hay fondo claro con texto oscuro? Probamos a mantener original
+    return thr
