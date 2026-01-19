@@ -5,7 +5,7 @@ import uuid
 import cv2
 import numpy as np
 from fastapi import APIRouter, UploadFile, File, HTTPException, Depends
-from fastapi.responses import StreamingResponse
+from fastapi.responses import StreamingResponse, FileResponse, HTMLResponse
 from app.ports.detector_port import PlateDetectorPort
 from app.ports.ocr_port import OcrPort
 from app.ports.info_extractor_port import InfoExtractorPort
@@ -112,28 +112,38 @@ async def ocr(
     except ValueError as exc:
         raise HTTPException(status_code=500, detail=str(exc))
 
-    # Debug save if enabled
-    if os.getenv("DEBUG_SAVE_PLATE"):
-        uid = uuid.uuid4().hex[:8]
-        cv2.imwrite(f"/tmp/plate_crop_{uid}.jpg", plate)
-        cv2.imwrite(f"/tmp/plate_ocr_ready_{uid}.jpg", thr)
+    # Debug save always enabled for diagnosis
+    debug_dir = "/tmp/debug_plates"
+    os.makedirs(debug_dir, exist_ok=True)
+    uid = uuid.uuid4().hex[:8]
+    cv2.imwrite(f"{debug_dir}/{uid}_01_crop.jpg", plate)
+    cv2.imwrite(f"{debug_dir}/{uid}_02_processed.jpg", thr)
 
     # 4) OCR con fallback si sale vacío
     raw_text = ocr_service.extract_text(thr).strip()
+    print(f"DEBUG: Initial OCR raw_text: {raw_text!r}")
+    
     if not raw_text:
         fallback_ocr = TesseractPlateAdapter(config="--oem 3 --psm 6 --dpi 300 -c tessedit_char_whitelist=ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789- ")
         raw_text = fallback_ocr.extract_text(thr).strip()
+        print(f"DEBUG: Fallback 1 raw_text: {raw_text!r}")
+        
     if not raw_text:
         gray = cv2.cvtColor(plate, cv2.COLOR_BGR2GRAY)
         raw_text = ocr_service.extract_text(gray).strip()
+        print(f"DEBUG: Fallback 2 (gray) raw_text: {raw_text!r}")
+        
     if not raw_text:
         raw_text = fallback_ocr.extract_text(cv2.cvtColor(plate, cv2.COLOR_BGR2GRAY)).strip()
+        print(f"DEBUG: Fallback 3 (gray+config) raw_text: {raw_text!r}")
 
     # 5) Normalize
     plate_text = services.normalize_hn_plate(raw_text)
+    print(f"DEBUG: Normalized text: {plate_text!r}")
 
     if not plate_text:
         # Error handling from original code
+        print(f"ERROR: OCR failed to match pattern. Raw: {raw_text!r}")
         raise HTTPException(status_code=422, detail=f"OCR did not match Honduras format (AAA####). raw={raw_text!r}")
 
     return {
@@ -236,3 +246,124 @@ async def extract_license(
     extractor: InfoExtractorPort = Depends(get_id_extractor),
 ):
     return await _process_identity_document(file, ocr_service, extractor)
+
+
+
+@router.get("/debug/test")
+def test_debug():
+    """Test endpoint to verify debug routes are working"""
+    return {"status": "ok", "message": "Debug endpoints are working"}
+
+
+@router.get("/debug/images")
+def list_debug_images():
+    """List all debug images saved in /tmp/debug_plates/"""
+    debug_dir = "/tmp/debug_plates"
+    try:
+        if not os.path.exists(debug_dir):
+            return {"files": [], "message": "Debug directory does not exist yet"}
+        files = sorted(os.listdir(debug_dir))
+        return {"files": files, "count": len(files), "directory": debug_dir}
+    except Exception as e:
+        return {"error": str(e), "files": []}
+
+
+@router.get("/debug/images/{filename}")
+def get_debug_image(filename: str):
+    """Download a specific debug image"""
+    # Sanitize filename to prevent directory traversal
+    filename = os.path.basename(filename)
+    file_path = f"/tmp/debug_plates/{filename}"
+    
+    if not os.path.exists(file_path):
+        raise HTTPException(status_code=404, detail=f"File not found: {filename}")
+    
+    
+    return FileResponse(file_path, media_type="image/jpeg", filename=filename)
+
+
+@router.get("/debug/viewer", response_class=HTMLResponse)
+def debug_viewer():
+    """HTML page to view all debug images"""
+    debug_dir = "/tmp/debug_plates"
+    
+    if not os.path.exists(debug_dir):
+        files = []
+    else:
+        files = sorted(os.listdir(debug_dir), reverse=True)  # Most recent first
+    
+    # Group files by UID (first 8 chars before _)
+    groups = {}
+    for f in files:
+        if '_' in f:
+            uid = f.split('_')[0]
+            if uid not in groups:
+                groups[uid] = {}
+            if '_01_crop' in f:
+                groups[uid]['crop'] = f
+            elif '_02_processed' in f:
+                groups[uid]['processed'] = f
+    
+    html = """
+    <!DOCTYPE html>
+    <html>
+    <head>
+        <title>Debug Images Viewer</title>
+        <style>
+            body { font-family: Arial, sans-serif; margin: 20px; background: #f5f5f5; }
+            h1 { color: #333; }
+            .image-group { 
+                background: white; 
+                padding: 20px; 
+                margin: 20px 0; 
+                border-radius: 8px;
+                box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+            }
+            .image-group h3 { margin-top: 0; color: #666; }
+            .images { display: flex; gap: 20px; flex-wrap: wrap; }
+            .image-container { flex: 1; min-width: 300px; }
+            .image-container h4 { margin: 10px 0; color: #444; }
+            img { 
+                max-width: 100%; 
+                border: 2px solid #ddd; 
+                border-radius: 4px;
+                background: #000;
+            }
+            .no-images { color: #999; font-style: italic; }
+        </style>
+    </head>
+    <body>
+        <h1>🔍 Debug Images Viewer</h1>
+        <p>Showing processed images from most recent to oldest</p>
+    """
+    
+    if not groups:
+        html += '<p class="no-images">No debug images found. Process an image first.</p>'
+    else:
+        for uid, imgs in groups.items():
+            html += f'<div class="image-group"><h3>Image ID: {uid}</h3><div class="images">'
+            
+            if 'crop' in imgs:
+                html += f'''
+                <div class="image-container">
+                    <h4>1. Cropped Plate (after deskew)</h4>
+                    <img src="/debug/images/{imgs['crop']}" alt="Crop">
+                </div>
+                '''
+            
+            if 'processed' in imgs:
+                html += f'''
+                <div class="image-container">
+                    <h4>2. Processed (sent to Tesseract)</h4>
+                    <img src="/debug/images/{imgs['processed']}" alt="Processed">
+                </div>
+                '''
+            
+            html += '</div></div>'
+    
+    html += """
+    </body>
+    </html>
+    """
+    
+    return HTMLResponse(content=html)

@@ -70,6 +70,98 @@ def shave_lr_edges(bin_img: np.ndarray, edge_white_frac: float = 0.55, max_shave
     return bin_img[:, left:right+1]
 
 
+
+def deskew_plate(img_bgr: np.ndarray) -> np.ndarray:
+    """
+    Corrects the skew of the plate image using contour analysis on character candidates.
+    Conservative approach to avoid over-rotation.
+    """
+    if img_bgr is None or img_bgr.size == 0:
+        return img_bgr
+
+    h_img, w_img = img_bgr.shape[:2]
+    
+    # Skip deskewing for very small images
+    if h_img < 30 or w_img < 60:
+        return img_bgr
+    
+    gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
+    
+    # Use adaptive threshold to handle shadows/gradients better than global Otsu
+    # Invert so text is white (foreground)
+    thresh = cv2.adaptiveThreshold(
+        gray, 255, 
+        cv2.ADAPTIVE_THRESH_GAUSSIAN_C, 
+        cv2.THRESH_BINARY_INV, 
+        19, 9
+    )
+
+    # Find contours
+    cnts, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    
+    if len(cnts) < 3:  # Need at least 3 character-like contours for reliable deskew
+        return img_bgr
+    
+    # Filter for character-like contours
+    merged_pts = []
+    
+    min_h = h_img * 0.15  # Lowered from 0.2 for more flexibility
+    max_h = h_img * 0.95
+    min_area = 50  # Minimum area to avoid noise
+    
+    for c in cnts:
+        area = cv2.contourArea(c)
+        if area < min_area:
+            continue
+            
+        x, y, w, h = cv2.boundingRect(c)
+        aspect = w / float(h) if h > 0 else 0
+        
+        # Filter noise: 
+        # - Height must be significant (character sized)
+        # - Aspect ratio reasonable for a letter/digit
+        if h > min_h and h < max_h and 0.15 < aspect < 2.5:
+            merged_pts.append(c)
+            
+    if len(merged_pts) < 3:  # Need at least 3 valid character contours
+        return img_bgr
+        
+    # Combine valid contours
+    all_points = np.vstack(merged_pts)
+    rect = cv2.minAreaRect(all_points)
+    center, size, angle = rect
+
+    # Correct angle logic
+    # OpenCV's minAreaRect returns angle in [-90, 0)
+    # We want to align the longest side horizontally
+    width, height = size
+    if width < height:
+        angle = angle + 90
+    
+    # Normalize angle to [-45, 45] range
+    if angle > 45:
+        angle = angle - 90
+    elif angle < -45:
+        angle = angle + 90
+        
+    # VERY conservative: only correct small tilts (max 10 degrees)
+    # Ignore rotations that are too small or too large
+    if abs(angle) < 0.5 or abs(angle) > 10.0:
+        return img_bgr
+
+    # Apply rotation
+    image_center = (w_img // 2, h_img // 2)
+    M = cv2.getRotationMatrix2D(image_center, angle, 1.0)
+    
+    rotated = cv2.warpAffine(
+        img_bgr, M, (w_img, h_img), 
+        flags=cv2.INTER_CUBIC, 
+        borderMode=cv2.BORDER_REPLICATE
+    )
+    return rotated
+
+
+
 def preprocess_for_ocr(plate_bgr: np.ndarray) -> np.ndarray:
     """
     Returns a binary image ready for OCR (white text on black background).
@@ -77,9 +169,13 @@ def preprocess_for_ocr(plate_bgr: np.ndarray) -> np.ndarray:
     if plate_bgr is None or plate_bgr.size == 0:
         raise ValueError("Empty plate image for OCR preprocessing")
 
+    # 0) Deskew (straighten) the plate before cropping vertical bands
+    plate_bgr = deskew_plate(plate_bgr)
+
     # 1) Crop useful band of the plate (avoid top/bottom borders)
+    # More aggressive crop to exclude "HONDURAS" text at top and "CENTROAMERICA" at bottom
     h, w = plate_bgr.shape[:2]
-    plate = plate_bgr[int(h * 0.22):int(h * 0.85), :]
+    plate = plate_bgr[int(h * 0.30):int(h * 0.75), :]
 
     # 2) Upscale to help OCR
     plate = cv2.resize(plate, None, fx=5, fy=5, interpolation=cv2.INTER_CUBIC)
@@ -96,11 +192,12 @@ def preprocess_for_ocr(plate_bgr: np.ndarray) -> np.ndarray:
     sharp = clahe.apply(sharp)
 
     # 4) Threshold inverted (text as white)
+    # Reduced block size and C value for cleaner edges
     thr_adapt = cv2.adaptiveThreshold(
         sharp, 255,
         cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
         cv2.THRESH_BINARY_INV,
-        35, 7
+        25, 5  # Changed from 35, 7 to get sharper edges
     )
     # Otsu fallback
     _, thr_otsu = cv2.threshold(sharp, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
@@ -110,17 +207,19 @@ def preprocess_for_ocr(plate_bgr: np.ndarray) -> np.ndarray:
         return abs(0.5 - p)
     thr = thr_adapt if balance_score(thr_adapt) < balance_score(thr_otsu) else thr_otsu
 
-    # 5) Morph close/open to clean noise without over-thickening
+    # 5) Morph operations - BALANCED approach
+    # Small CLOSE to connect broken characters (numbers with cuts)
+    # Then OPEN to remove small noise
     thr = cv2.morphologyEx(
         thr,
         cv2.MORPH_CLOSE,
-        cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5)),
+        cv2.getStructuringElement(cv2.MORPH_RECT, (2, 2)),  # Very small kernel
         iterations=1
     )
     thr = cv2.morphologyEx(
         thr,
         cv2.MORPH_OPEN,
-        cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3)),
+        cv2.getStructuringElement(cv2.MORPH_RECT, (2, 2)),
         iterations=1
     )
 

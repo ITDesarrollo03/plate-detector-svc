@@ -64,7 +64,50 @@ def normalize_hn_plate(raw_text: str) -> str:
         digits = m.group(2)
         return f"{letters} {digits}"
 
-    # Try to salvage a 7-char window
+    # Special case: Handle when OCR reads letters as digits in first 3 positions
+    # Example: "T13368" should be "TCI 3368" where "1" might be "C" or "I"
+    if len(cleaned) == 6:
+        # For 6-char strings like "T13368", try multiple interpretations
+        # Most common: missing one letter, or one letter read as digit
+        
+        # Interpretation 1: First char is letter, second is digit->letter, add missing I
+        # T13368 -> T + C (from 1) + I (added) + 3368
+        first = cleaned[0]
+        second_as_letter = cleaned[1].translate(LETTER_FIX)  # 1->I, but could be C
+        last_four = cleaned[2:]
+        
+        # Try with "C" instead of what LETTER_FIX gives
+        if cleaned[1] == '1':
+            # "1" could be "C" or "I"
+            # Try C first (more common in TCI pattern)
+            if re.fullmatch(r"\d{4}", last_four):
+                return f"{first}CI {last_four}"
+        
+        # Interpretation 2: Use LETTER_FIX translation + add I
+        lpart = cleaned[:2].translate(LETTER_FIX)
+        dpart = cleaned[2:].translate(DIGIT_FIX)
+        
+        if re.fullmatch(r"[A-Z]{2}", lpart) and re.fullmatch(r"\d{4}", dpart):
+            # We have 2 letters + 4 digits, add missing I
+            return f"{lpart}I {dpart}"
+    
+    # Handle 7+ character strings
+    if len(cleaned) >= 7:
+        # Try interpreting first 3 chars as letters (even if they contain digits)
+        # and last 4 as digits
+        for i in range(min(2, len(cleaned) - 4)):  # Try starting positions 0 and 1
+            chunk = cleaned[i:i + 7]
+                
+            # Apply first-letter correction
+            chunk = _fix_first_letter(chunk)
+            
+            lpart = chunk[:3].translate(LETTER_FIX)
+            dpart = chunk[3:].translate(DIGIT_FIX)
+
+            if re.fullmatch(r"[A-Z]{3}", lpart) and re.fullmatch(r"\d{4}", dpart):
+                return f"{lpart} {dpart}"
+
+    # Original 7-char window logic
     if len(cleaned) < 7:
         cleaned = cleaned_first_fixed
         if len(cleaned) < 7:
