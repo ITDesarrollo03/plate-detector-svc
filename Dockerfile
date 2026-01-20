@@ -18,7 +18,9 @@ RUN pip install --upgrade pip && \
 COPY app ./app
 COPY models ./models
 
-RUN apt-get update && apt-get install -y tesseract-ocr \
+RUN apt-get update && apt-get install -y \
+    tesseract-ocr \
+    tesseract-ocr-spa \
     && rm -rf /var/lib/apt/lists/*
 
 EXPOSE 8000
