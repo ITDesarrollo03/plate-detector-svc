@@ -1,0 +1,290 @@
+# GitHub Actions workflow para crear releases automáticos
+name: Build and Release
+
+on:
+  push:
+    branches:
+      - master
+      - main
+    tags:
+      - 'v*'
+  pull_request:
+    branches:
+      - master
+      - main
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version number (e.g., 1.0.0)'
+        required: false
+        default: ''
+
+jobs:
+  build:
+    name: Build Release Package
+    runs-on: windows-latest
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Setup PowerShell
+      shell: pwsh
+      run: |
+        Write-Host "PowerShell Version: $($PSVersionTable.PSVersion)"
+        Write-Host "OS: $env:OS"
+
+    - name: Verify YOLO Model
+      shell: pwsh
+      run: |
+        $modelPath = "models/plate-detector.pt"
+        if (Test-Path $modelPath) {
+            $size = (Get-Item $modelPath).Length / 1MB
+            Write-Host "✓ YOLO model found: $([math]::Round($size, 2)) MB"
+        } else {
+            Write-Error "YOLO model not found at $modelPath"
+            exit 1
+        }
+
+    - name: Create Release Package
+      shell: pwsh
+      run: |
+        ./create-release.ps1
+
+    - name: Get Version
+      id: version
+      shell: pwsh
+      run: |
+        # Si es un tag, usar el tag como versión
+        if ("${{ github.ref }}" -match "refs/tags/v(.+)") {
+            $version = $matches[1]
+        }
+        # Si se proporcionó versión manualmente
+        elseif ("${{ github.event.inputs.version }}" -ne "") {
+            $version = "${{ github.event.inputs.version }}"
+        }
+        # Por defecto, usar fecha y hora
+        else {
+            $version = "1.0.${{ github.run_number }}"
+        }
+
+        Write-Host "Version: $version"
+        echo "version=$version" >> $env:GITHUB_OUTPUT
+
+    - name: Rename Release Package
+      shell: pwsh
+      run: |
+        $version = "${{ steps.version.outputs.version }}"
+        $sourceDir = "release"
+        $zipFiles = Get-ChildItem -Path $sourceDir -Filter "*.zip"
+
+        if ($zipFiles.Count -eq 0) {
+            Write-Error "No ZIP file found in release directory"
+            exit 1
+        }
+
+        $originalZip = $zipFiles[0].FullName
+        $newName = "PlateDetector-v$version.zip"
+        $newPath = Join-Path (Split-Path $originalZip) $newName
+
+        Rename-Item -Path $originalZip -NewName $newName
+        Write-Host "Renamed to: $newName"
+
+        # Guardar ruta para siguiente step
+        echo "release_zip=$newPath" >> $env:GITHUB_OUTPUT
+
+      id: rename
+
+    - name: Upload Artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: PlateDetector-Release
+        path: release/*.zip
+        retention-days: 90
+
+    - name: Generate Build Summary
+      shell: pwsh
+      run: |
+        $zipFile = Get-ChildItem -Path "release" -Filter "*.zip" | Select-Object -First 1
+        $zipSize = ($zipFile.Length / 1MB)
+        $version = "${{ steps.version.outputs.version }}"
+
+        $summary = @"
+        ## 📦 Release Package Created
+
+        - **Version:** $version
+        - **Package:** $($zipFile.Name)
+        - **Size:** $([math]::Round($zipSize, 2)) MB
+        - **Run:** ${{ github.run_number }}
+        - **Branch:** ${{ github.ref_name }}
+
+        ### 📋 Contents
+        - Application code (app/)
+        - YOLO model (models/)
+        - Deployment scripts (deployment/)
+        - IIS configuration (web.config)
+        - Quick installer (INSTALL.ps1)
+        - Documentation (README.txt, CLAUDE.md)
+
+        ### 🚀 Next Steps
+        1. Download the artifact from this workflow run
+        2. Copy to Windows Server 2022
+        3. Extract ZIP and run INSTALL.ps1 as Administrator
+
+        ### 📊 Performance (CPU)
+        - Detección YOLO: 200-500ms
+        - OCR Tesseract: 500-1500ms
+        - Total: 1-2.5 segundos
+        "@
+
+        # Escribir al GitHub Step Summary
+        Add-Content -Path $env:GITHUB_STEP_SUMMARY -Value $summary
+
+  release:
+    name: Create GitHub Release
+    runs-on: windows-latest
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v')
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Download Artifact
+      uses: actions/download-artifact@v4
+      with:
+        name: PlateDetector-Release
+        path: ./artifacts
+
+    - name: Get Version from Tag
+      id: version
+      shell: pwsh
+      run: |
+        $tag = "${{ github.ref_name }}"
+        $version = $tag.Replace("v", "")
+        echo "version=$version" >> $env:GITHUB_OUTPUT
+        echo "tag=$tag" >> $env:GITHUB_OUTPUT
+
+    - name: Create Release Notes
+      id: release_notes
+      shell: pwsh
+      run: |
+        $version = "${{ steps.version.outputs.version }}"
+
+        $releaseNotes = @"
+        # Plate Detector Service - Release $version
+
+        ## 📦 Instalación
+
+        1. Descargar **PlateDetector-v$version.zip**
+        2. Extraer en Windows Server 2022
+        3. Ejecutar **INSTALL.ps1** como Administrador
+        4. Seguir instrucciones en pantalla
+
+        ## 🆕 Características
+
+        - Detección de placas vehiculares Honduras (formato AAA####)
+        - OCR con Tesseract optimizado para placas
+        - Extracción de información de documentos (DNI, Licencia)
+        - Procesamiento de documentos de despacho
+        - API REST con FastAPI
+        - Debug viewer integrado
+
+        ## 📋 Requisitos del Sistema
+
+        - Windows Server 2022
+        - IIS 10
+        - 5 GB espacio en disco
+        - Conexión a Internet (para instalación)
+
+        **Instalación Automática incluye:**
+        - Python 3.11
+        - Visual C++ Redistributables
+        - Tesseract OCR + datos español
+        - HttpPlatformHandler para IIS
+
+        ## 🔧 Configuración Post-Instalación
+
+        - **URL del servicio:** http://localhost:8000
+        - **Documentación API:** http://localhost:8000/docs
+        - **Debug viewer:** http://localhost:8000/debug/viewer
+        - **Logs:** C:\inetpub\wwwroot\PlateDetector\logs\stdout.log
+
+        ## 🎯 Endpoints Disponibles
+
+        - `POST /detect` - Detectar placa en imagen
+        - `POST /ocr` - Detectar + OCR de placa
+        - `POST /extract-info` - Extraer info de documento de despacho
+        - `POST /dni/extract` - Extraer info de DNI
+        - `POST /license/extract` - Extraer info de licencia
+        - `GET /debug/viewer` - Visor de imágenes debug
+        - `GET /docs` - Documentación interactiva
+
+        ## 📊 Performance Esperado (CPU)
+
+        - Detección YOLO: 200-500ms
+        - Preprocesamiento: 100-200ms
+        - OCR Tesseract: 500-1500ms
+        - **Total por request: 1-2.5 segundos**
+        - Memoria: 800MB - 1GB
+
+        ## 📝 Documentación
+
+        Ver archivos incluidos en el paquete:
+        - **README.txt** - Guía de instalación rápida
+        - **CLAUDE.md** - Documentación técnica del proyecto
+        - **deployment/README.md** - Guía detallada de deployment
+
+        ## 🐛 Troubleshooting Común
+
+        ### Error: HTTP 503
+        - Revisar logs en: C:\inetpub\wwwroot\PlateDetector\logs\stdout.log
+        - Verificar Application Pool iniciado
+        - Verificar permisos en directorio
+
+        ### Error: "Tesseract not found"
+        - Verificar instalación: C:\Program Files\Tesseract-OCR\tesseract.exe
+        - Verificar datos español: tessdata\spa.traineddata
+        - Reiniciar Application Pool
+
+        ### Error: "Model not found"
+        - Verificar: C:\inetpub\wwwroot\PlateDetector\models\plate-detector.pt
+        - Debe ser ~6 MB
+
+        ## 🔄 Actualización desde Versión Anterior
+
+        1. Detener Application Pool en IIS Manager
+        2. Backup de C:\inetpub\wwwroot\PlateDetector\app
+        3. Ejecutar deployment\07-deploy-app.ps1
+        4. Iniciar Application Pool
+
+        ## 📞 Soporte
+
+        Para reportar problemas o solicitar ayuda:
+        - GitHub Issues: ${{ github.server_url }}/${{ github.repository }}/issues
+        - Documentación: Ver CLAUDE.md
+
+        ---
+
+        **Build:** ${{ github.run_number }}
+        **Commit:** ${{ github.sha }}
+        **Fecha:** $(Get-Date -Format "yyyy-MM-dd HH:mm:ss")
+        "@
+
+        # Guardar en archivo
+        $notesFile = "release-notes.md"
+        Set-Content -Path $notesFile -Value $releaseNotes
+
+        # Output para siguiente step
+        echo "notes_file=$notesFile" >> $env:GITHUB_OUTPUT
+
+    - name: Create GitHub Release
+      uses: softprops/action-gh-release@v1
+      with:
+        name: Release ${{ steps.version.outputs.tag }}
+        body_path: release-notes.md
+        files: ./artifacts/*.zip
+        draft: false
+        prerelease: false
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

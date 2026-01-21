@@ -1,0 +1,294 @@
+# Azure Pipelines CI/CD para Plate Detector Service
+# Crea release package automáticamente y publica artefactos
+
+trigger:
+  branches:
+    include:
+      - master
+      - main
+      - release/*
+  tags:
+    include:
+      - v*
+
+pr:
+  branches:
+    include:
+      - master
+      - main
+
+variables:
+  pythonVersion: '3.11'
+  buildConfiguration: 'Release'
+  # Versión del proyecto (actualizar manualmente o usar GitVersion)
+  majorVersion: 1
+  minorVersion: 0
+  patchVersion: $(Build.BuildId)
+
+pool:
+  vmImage: 'windows-latest'
+
+stages:
+- stage: Build
+  displayName: 'Build and Package'
+  jobs:
+  - job: CreateRelease
+    displayName: 'Create Release Package'
+    steps:
+
+    # Checkout del código
+    - checkout: self
+      fetchDepth: 1
+      clean: true
+
+    # Mostrar información del build
+    - task: PowerShell@2
+      displayName: 'Display Build Info'
+      inputs:
+        targetType: 'inline'
+        script: |
+          Write-Host "Build ID: $(Build.BuildId)"
+          Write-Host "Build Number: $(Build.BuildNumber)"
+          Write-Host "Source Branch: $(Build.SourceBranch)"
+          Write-Host "Version: $(majorVersion).$(minorVersion).$(patchVersion)"
+
+    # Verificar que el modelo YOLO existe
+    - task: PowerShell@2
+      displayName: 'Verify YOLO Model'
+      inputs:
+        targetType: 'inline'
+        script: |
+          $modelPath = "$(Build.SourcesDirectory)\models\plate-detector.pt"
+          if (Test-Path $modelPath) {
+              $size = (Get-Item $modelPath).Length / 1MB
+              Write-Host "✓ YOLO model found: $([math]::Round($size, 2)) MB"
+          } else {
+              Write-Host "##vso[task.logissue type=error]YOLO model not found at $modelPath"
+              Write-Host "##vso[task.complete result=Failed;]"
+              exit 1
+          }
+
+    # Limpiar releases anteriores
+    - task: PowerShell@2
+      displayName: 'Clean Previous Releases'
+      inputs:
+        targetType: 'inline'
+        script: |
+          if (Test-Path "$(Build.SourcesDirectory)\release") {
+              Remove-Item -Path "$(Build.SourcesDirectory)\release" -Recurse -Force
+              Write-Host "Cleaned previous release directory"
+          }
+
+    # Ejecutar script de creación de release
+    - task: PowerShell@2
+      displayName: 'Create Release Package'
+      inputs:
+        filePath: '$(Build.SourcesDirectory)\create-release.ps1'
+        workingDirectory: '$(Build.SourcesDirectory)'
+        pwsh: false
+
+    # Renombrar ZIP con número de versión
+    - task: PowerShell@2
+      displayName: 'Rename Release Package'
+      inputs:
+        targetType: 'inline'
+        script: |
+          $sourceDir = "$(Build.SourcesDirectory)\release"
+          $zipFiles = Get-ChildItem -Path $sourceDir -Filter "*.zip"
+
+          if ($zipFiles.Count -eq 0) {
+              Write-Host "##vso[task.logissue type=error]No ZIP file found in release directory"
+              exit 1
+          }
+
+          $originalZip = $zipFiles[0].FullName
+          $version = "$(majorVersion).$(minorVersion).$(patchVersion)"
+          $newZip = Join-Path $sourceDir "PlateDetector-v$version.zip"
+
+          Rename-Item -Path $originalZip -NewName (Split-Path $newZip -Leaf)
+          Write-Host "Renamed to: $(Split-Path $newZip -Leaf)"
+
+          # Crear variable para usar en otros stages
+          Write-Host "##vso[task.setvariable variable=releaseZipPath;isOutput=true]$newZip"
+          Write-Host "##vso[task.setvariable variable=releaseVersion;isOutput=true]$version"
+
+    # Copiar archivos al staging directory
+    - task: CopyFiles@2
+      displayName: 'Copy Release to Staging'
+      inputs:
+        SourceFolder: '$(Build.SourcesDirectory)\release'
+        Contents: '*.zip'
+        TargetFolder: '$(Build.ArtifactStagingDirectory)'
+        CleanTargetFolder: true
+
+    # Publicar artefacto
+    - task: PublishBuildArtifacts@1
+      displayName: 'Publish Release Artifact'
+      inputs:
+        PathtoPublish: '$(Build.ArtifactStagingDirectory)'
+        ArtifactName: 'PlateDetectorRelease'
+        publishLocation: 'Container'
+
+    # Crear resumen del build
+    - task: PowerShell@2
+      displayName: 'Create Build Summary'
+      inputs:
+        targetType: 'inline'
+        script: |
+          $zipFile = Get-ChildItem -Path "$(Build.ArtifactStagingDirectory)" -Filter "*.zip" | Select-Object -First 1
+          $zipSize = ($zipFile.Length / 1MB)
+
+          $summary = @"
+          ## Release Package Created
+
+          - **Version:** $(majorVersion).$(minorVersion).$(patchVersion)
+          - **Package:** $($zipFile.Name)
+          - **Size:** $([math]::Round($zipSize, 2)) MB
+          - **Build:** $(Build.BuildNumber)
+          - **Branch:** $(Build.SourceBranchName)
+
+          ### Contents
+          - Application code (app/)
+          - YOLO model (models/)
+          - Deployment scripts (deployment/)
+          - IIS configuration (web.config)
+          - Quick installer (INSTALL.ps1)
+          - Documentation (README.txt, CLAUDE.md)
+
+          ### Next Steps
+          1. Download the artifact from this build
+          2. Copy to Windows Server 2022
+          3. Extract ZIP and run INSTALL.ps1 as Administrator
+          "@
+
+          Write-Host $summary
+
+          # Escribir al build summary (solo en Azure DevOps)
+          $summaryFile = "$(Build.ArtifactStagingDirectory)\build-summary.md"
+          Set-Content -Path $summaryFile -Value $summary
+          Write-Host "##vso[task.uploadsummary]$summaryFile"
+
+# Stage opcional: Deployment a DEV/QA
+- stage: DeployToDev
+  displayName: 'Deploy to DEV Server'
+  dependsOn: Build
+  condition: and(succeeded(), eq(variables['Build.SourceBranch'], 'refs/heads/master'))
+  jobs:
+  - deployment: DeployDev
+    displayName: 'Deploy to DEV'
+    environment: 'DEV-PlateDetector'
+    strategy:
+      runOnce:
+        deploy:
+          steps:
+          - task: PowerShell@2
+            displayName: 'Deploy to IIS'
+            inputs:
+              targetType: 'inline'
+              script: |
+                Write-Host "Deployment to DEV server"
+                Write-Host "TODO: Implementar deployment automático"
+
+                # Ejemplo de deployment:
+                # 1. Detener Application Pool
+                # Stop-WebAppPool -Name "PlateDetectorAppPool"
+
+                # 2. Backup actual
+                # $timestamp = Get-Date -Format "yyyyMMdd-HHmmss"
+                # Copy-Item -Path "C:\inetpub\wwwroot\PlateDetector\app" `
+                #           -Destination "C:\inetpub\wwwroot\PlateDetector\app-backup-$timestamp" -Recurse
+
+                # 3. Extraer nuevo release
+                # Expand-Archive -Path "$(Pipeline.Workspace)\PlateDetectorRelease\*.zip" `
+                #                -DestinationPath "C:\Temp\PlateDetector" -Force
+
+                # 4. Copiar archivos
+                # Copy-Item -Path "C:\Temp\PlateDetector\app\*" `
+                #           -Destination "C:\inetpub\wwwroot\PlateDetector\app\" -Recurse -Force
+
+                # 5. Iniciar Application Pool
+                # Start-WebAppPool -Name "PlateDetectorAppPool"
+
+                # 6. Verificar salud del servicio
+                # Start-Sleep -Seconds 10
+                # Invoke-RestMethod -Uri "http://localhost:8000/debug/test"
+
+# Stage opcional: Release to Production
+- stage: Release
+  displayName: 'Create GitHub/Azure Release'
+  dependsOn: Build
+  condition: and(succeeded(), startsWith(variables['Build.SourceBranch'], 'refs/tags/v'))
+  jobs:
+  - job: CreateRelease
+    displayName: 'Create Release'
+    steps:
+    - task: PowerShell@2
+      displayName: 'Prepare Release Notes'
+      inputs:
+        targetType: 'inline'
+        script: |
+          $version = "$(Build.SourceBranchName)".Replace("v", "")
+
+          $releaseNotes = @"
+          # Plate Detector Service - Release $version
+
+          ## 📦 Instalación
+
+          1. Descargar **PlateDetector-v$version.zip**
+          2. Extraer en Windows Server 2022
+          3. Ejecutar **INSTALL.ps1** como Administrador
+          4. Seguir instrucciones en pantalla
+
+          ## 🆕 Características
+
+          - Detección de placas vehiculares Honduras (formato AAA####)
+          - OCR con Tesseract optimizado para placas
+          - Extracción de información de documentos (DNI, Licencia)
+          - API REST con FastAPI
+          - Debug viewer integrado
+
+          ## 📋 Requisitos
+
+          - Windows Server 2022
+          - IIS 10
+          - Python 3.11 (instalado automáticamente)
+          - Tesseract OCR (instalado automáticamente)
+
+          ## 🔧 Configuración
+
+          - **URL del servicio:** http://localhost:8000
+          - **Documentación API:** http://localhost:8000/docs
+          - **Debug viewer:** http://localhost:8000/debug/viewer
+
+          ## 📊 Performance Esperado (CPU)
+
+          - Detección YOLO: 200-500ms
+          - OCR Tesseract: 500-1500ms
+          - Total por request: 1-2.5 segundos
+
+          ## 📝 Documentación
+
+          Ver **README.txt** y **CLAUDE.md** incluidos en el paquete.
+
+          ## 🐛 Troubleshooting
+
+          - Logs: C:\inetpub\wwwroot\PlateDetector\logs\stdout.log
+          - Ver deployment\README.md para solución de problemas comunes
+
+          ---
+
+          **Build:** $(Build.BuildNumber)
+          **Fecha:** $(Build.BuildDate)
+          "@
+
+          $notesFile = "$(Build.ArtifactStagingDirectory)\release-notes.md"
+          Set-Content -Path $notesFile -Value $releaseNotes
+
+          Write-Host "Release notes created for version $version"
+
+    # Publicar release notes como artefacto
+    - task: PublishBuildArtifacts@1
+      displayName: 'Publish Release Notes'
+      inputs:
+        PathtoPublish: '$(Build.ArtifactStagingDirectory)\release-notes.md'
+        ArtifactName: 'ReleaseNotes'

@@ -14,6 +14,7 @@ from app.adapters.ocr.tesseract_adapter import TesseractPlateAdapter
 from app.adapters.ocr.tesseract_document_adapter import TesseractDocumentAdapter
 from app.adapters.extraction.regex_id_adapter import RegexIdAdapter
 from app.domain import image_utils, services
+from app.core.config import settings
 
 router = APIRouter()
 
@@ -113,7 +114,7 @@ async def ocr(
         raise HTTPException(status_code=500, detail=str(exc))
 
     # Debug save always enabled for diagnosis
-    debug_dir = "/tmp/debug_plates"
+    debug_dir = settings.debug_dir
     os.makedirs(debug_dir, exist_ok=True)
     uid = uuid.uuid4().hex[:8]
     cv2.imwrite(f"{debug_dir}/{uid}_01_crop.jpg", plate)
@@ -257,8 +258,8 @@ def test_debug():
 
 @router.get("/debug/images")
 def list_debug_images():
-    """List all debug images saved in /tmp/debug_plates/"""
-    debug_dir = "/tmp/debug_plates"
+    """List all debug images saved in debug directory"""
+    debug_dir = settings.debug_dir
     try:
         if not os.path.exists(debug_dir):
             return {"files": [], "message": "Debug directory does not exist yet"}
@@ -273,7 +274,7 @@ def get_debug_image(filename: str):
     """Download a specific debug image"""
     # Sanitize filename to prevent directory traversal
     filename = os.path.basename(filename)
-    file_path = f"/tmp/debug_plates/{filename}"
+    file_path = f"{settings.debug_dir}/{filename}"
     
     if not os.path.exists(file_path):
         raise HTTPException(status_code=404, detail=f"File not found: {filename}")
@@ -285,7 +286,7 @@ def get_debug_image(filename: str):
 @router.get("/debug/viewer", response_class=HTMLResponse)
 def debug_viewer():
     """HTML page to view all debug images"""
-    debug_dir = "/tmp/debug_plates"
+    debug_dir = settings.debug_dir
     
     if not os.path.exists(debug_dir):
         files = []
